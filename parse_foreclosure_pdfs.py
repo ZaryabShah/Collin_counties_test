@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 COLLIN COUNTY FORECLOSURE PDF PARSER WITH GEMINI AI
-Parses PDF files and updates collin_foreclosures.json with extracted data
+Parses PDF files and saves extracted data to parsed_foreclosure_data.json
 """
 
 import os
@@ -54,6 +54,7 @@ class ForeClosureData:
     deed_of_trust_recording_date: Optional[str] = None
     deed_of_trust_volume_page: Optional[str] = None
     deed_of_trust_instrument_number: Optional[str] = None
+    deed_of_trust_number: Optional[str] = None
     
     # Sale information
     sale_date: Optional[str] = None
@@ -188,6 +189,7 @@ REQUIRED JSON OUTPUT FORMAT:
     "deed_of_trust_recording_date": "Extract recording date",
     "deed_of_trust_volume_page": "Extract volume and page numbers",
     "deed_of_trust_instrument_number": "Extract instrument/document number",
+    "deed_of_trust_number": "Extract deed of trust number/ID",
     "sale_date": "Extract foreclosure sale date",
     "sale_time": "Extract sale time",
     "sale_location": "Extract where sale will be held",
@@ -214,9 +216,10 @@ EXTRACTION RULES:
 7. Extract ALL borrower names mentioned
 8. Clean names by removing titles, addresses, and extra text
 9. Look for recording information (volume, page, instrument numbers)
-10. Extract sale details (date, time, location)
-11. CRITICAL: Distinguish between PROPERTY ADDRESS and ATTORNEY/OFFICE addresses
-12. Look for Collin County specific details
+10. Look for deed of trust number (may appear as "Deed of Trust #", "DOT #", "Trust Deed No.", or similar)
+11. Extract sale details (date, time, location)
+12. CRITICAL: Distinguish between PROPERTY ADDRESS and ATTORNEY/OFFICE addresses
+13. Look for Collin County specific details
 13. IMPORTANT: Ensure all string values are properly escaped (no unescaped quotes or backslashes)
 14. IMPORTANT: Do not include newlines or tabs inside string values
 
@@ -444,6 +447,7 @@ RESPOND WITH CLEAN JSON ONLY - START WITH {{ AND END WITH }}"""
                 "deed_of_trust_recording_date": None,
                 "deed_of_trust_volume_page": None,
                 "deed_of_trust_instrument_number": None,
+                "deed_of_trust_number": None,
                 "sale_date": None,
                 "sale_time": None,
                 "sale_location": None,
@@ -464,6 +468,7 @@ RESPOND WITH CLEAN JSON ONLY - START WITH {{ AND END WITH }}"""
                 "property_address": r'"property_address":\s*"([^"]*)"',
                 "legal_description": r'"legal_description":\s*"([^"]*)"',
                 "original_loan_amount": r'"original_loan_amount":\s*"([^"]*)"',
+                "deed_of_trust_number": r'"deed_of_trust_number":\s*"([^"]*)"',
                 "sale_date": r'"sale_date":\s*"([^"]*)"',
                 "sale_time": r'"sale_time":\s*"([^"]*)"',
                 "sale_location": r'"sale_location":\s*"([^"]*)"',
@@ -538,6 +543,7 @@ RESPOND WITH CLEAN JSON ONLY - START WITH {{ AND END WITH }}"""
             deed_of_trust_recording_date=ai_response.get('deed_of_trust_recording_date'),
             deed_of_trust_volume_page=ai_response.get('deed_of_trust_volume_page'),
             deed_of_trust_instrument_number=ai_response.get('deed_of_trust_instrument_number'),
+            deed_of_trust_number=ai_response.get('deed_of_trust_number'),
             sale_date=ai_response.get('sale_date'),
             sale_time=ai_response.get('sale_time'),
             sale_location=ai_response.get('sale_location'),
@@ -575,6 +581,7 @@ RESPOND WITH CLEAN JSON ONLY - START WITH {{ AND END WITH }}"""
             "deed_of_trust_recording_date": None,
             "deed_of_trust_volume_page": None,
             "deed_of_trust_instrument_number": None,
+            "deed_of_trust_number": None,
             "sale_date": None,
             "sale_time": None,
             "sale_location": None,
@@ -667,10 +674,10 @@ RESPOND WITH CLEAN JSON ONLY - START WITH {{ AND END WITH }}"""
             return None
 
 class ForeClosureJSONUpdater:
-    """Updates collin_foreclosures.json with parsed PDF data"""
+    """Saves parsed PDF data to a separate JSON file"""
     
-    def __init__(self, json_file_path: str, checkpoint_file: str):
-        self.json_file_path = json_file_path
+    def __init__(self, parsed_data_file: str, checkpoint_file: str):
+        self.parsed_data_file = parsed_data_file
         self.checkpoint_file = checkpoint_file
         self.processed_pdfs = self.load_checkpoints()
     
@@ -694,105 +701,121 @@ class ForeClosureJSONUpdater:
         with open(self.checkpoint_file, 'w') as f:
             json.dump(checkpoint_data, f, indent=2)
     
-    def load_foreclosure_data(self) -> List[Dict]:
-        """Load the main foreclosure JSON data"""
+    def load_parsed_data(self) -> List[Dict]:
+        """Load existing parsed PDF data"""
         try:
-            with open(self.json_file_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            if os.path.exists(self.parsed_data_file):
+                with open(self.parsed_data_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            return []
         except Exception as e:
-            print(f"❌ Error loading JSON file: {e}")
+            print(f"❌ Error loading parsed data file: {e}")
             return []
     
-    def save_foreclosure_data(self, data: List[Dict]):
-        """Save updated foreclosure data"""
+    def save_parsed_data(self, data: List[Dict]):
+        """Save parsed PDF data to separate file"""
         try:
-            with open(self.json_file_path, 'w', encoding='utf-8') as f:
+            with open(self.parsed_data_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            print(f"✅ Updated {self.json_file_path}")
+            print(f"✅ Saved parsed data to {self.parsed_data_file}")
         except Exception as e:
-            print(f"❌ Error saving JSON file: {e}")
+            print(f"❌ Error saving parsed data file: {e}")
     
-    def find_matching_record(self, foreclosure_data: ForeClosureData, json_records: List[Dict]) -> Optional[int]:
-        """Find matching record in JSON data based on detail_id from PDF filename"""
+    def check_if_already_parsed(self, foreclosure_data: ForeClosureData, parsed_records: List[Dict]) -> bool:
+        """Check if this PDF has already been parsed"""
         pdf_filename = foreclosure_data.source_pdf_file
         if not pdf_filename:
-            return None
+            return False
         
         # Extract detail_id from filename (e.g., "3927190.pdf" -> "3927190")
         detail_id = pdf_filename.replace('.pdf', '')
         
-        for i, record in enumerate(json_records):
+        for record in parsed_records:
             if record.get('detail_id') == detail_id:
-                return i
+                return True
         
-        return None
+        return False
     
-    def update_record_with_pdf_data(self, record: Dict, foreclosure_data: ForeClosureData) -> Dict:
-        """Update JSON record with parsed PDF data"""
-        updated_record = record.copy()
-        
-        # Map PDF data to JSON fields
+    def create_parsed_record(self, foreclosure_data: ForeClosureData) -> Dict:
+        """Create a new record from parsed PDF data"""
         pdf_data = asdict(foreclosure_data)
+        pdf_filename = foreclosure_data.source_pdf_file
         
-        # Update fields that are commonly missing in "FILED" records
-        if pdf_data.get('property_address') and not updated_record.get('full_address'):
-            updated_record['full_address'] = pdf_data['property_address']
-            # Try to parse address components
-            address_parts = self._parse_address(pdf_data['property_address'])
-            if address_parts:
-                updated_record.update(address_parts)
+        # Extract detail_id from filename (e.g., "3927190.pdf" -> "3927190")
+        detail_id = pdf_filename.replace('.pdf', '') if pdf_filename else None
         
-        if pdf_data.get('legal_description') and not updated_record.get('legal_description'):
-            updated_record['legal_description'] = pdf_data['legal_description']
-        
-        if pdf_data.get('borrower_names'):
-            # Update owner names
-            borrowers = pdf_data['borrower_names']
-            if len(borrowers) >= 1:
-                name_parts = self._parse_name(borrowers[0])
-                updated_record['owner_1_first_name'] = name_parts.get('first', '')
-                updated_record['owner_1_last_name'] = name_parts.get('last', '')
-                if len(borrowers) >= 2:
-                    name_parts2 = self._parse_name(borrowers[1])
-                    updated_record['owner_2_first_name'] = name_parts2.get('first', '')
-                    updated_record['owner_2_last_name'] = name_parts2.get('last', '')
-                
-                # Create combined owner name
-                updated_record['owner_name'] = ' & '.join(borrowers)
-        
-        if pdf_data.get('deed_of_trust_recording_date') and not updated_record.get('recorded_date'):
-            updated_record['recorded_date'] = pdf_data['deed_of_trust_recording_date']
-        
-        if pdf_data.get('deed_of_trust_instrument_number'):
-            updated_record['document_id'] = pdf_data['deed_of_trust_instrument_number']
-            updated_record['deed_of_trust_number'] = pdf_data['deed_of_trust_instrument_number']
-            updated_record['deed_number'] = pdf_data['deed_of_trust_instrument_number']
-        
-        if pdf_data.get('deed_of_trust_date') and not updated_record.get('deed_date'):
-            updated_record['deed_date'] = pdf_data['deed_of_trust_date']
-        
-        # Add PDF parsing metadata
-        updated_record['pdf_parsed'] = True
-        updated_record['pdf_parse_timestamp'] = foreclosure_data.extraction_timestamp
-        updated_record['pdf_ai_confidence'] = foreclosure_data.ai_confidence
-        
-        # Store additional PDF data in a separate field
-        updated_record['pdf_extracted_data'] = {
+        # Create comprehensive record with all parsed data
+        parsed_record = {
+            # Identifier
+            'detail_id': detail_id,
+            'source_pdf_file': pdf_filename,
+            
+            # Case Information
+            'case_number': pdf_data.get('case_number'),
+            'filing_date': pdf_data.get('filing_date'),
+            'case_type': pdf_data.get('case_type'),
+            'court': pdf_data.get('court'),
+            
+            # Parties
             'plaintiff': pdf_data.get('plaintiff'),
             'defendant': pdf_data.get('defendant'),
             'trustee': pdf_data.get('trustee'),
+            'borrower_names': pdf_data.get('borrower_names', []),
+            'lender_name': pdf_data.get('lender_name'),
+            
+            # Property Information
+            'property_address': pdf_data.get('property_address'),
+            'legal_description': pdf_data.get('legal_description'),
+            'parcel_number': pdf_data.get('parcel_number'),
+            'lot_block_subdivision': pdf_data.get('lot_block_subdivision'),
+            
+            # Financial Information
             'original_loan_amount': pdf_data.get('original_loan_amount'),
             'unpaid_balance': pdf_data.get('unpaid_balance'),
             'total_debt': pdf_data.get('total_debt'),
+            
+            # Deed of Trust Information
+            'deed_of_trust_date': pdf_data.get('deed_of_trust_date'),
+            'deed_of_trust_recording_date': pdf_data.get('deed_of_trust_recording_date'),
+            'deed_of_trust_volume_page': pdf_data.get('deed_of_trust_volume_page'),
+            'deed_of_trust_instrument_number': pdf_data.get('deed_of_trust_instrument_number'),
+            'deed_of_trust_number': pdf_data.get('deed_of_trust_number'),
+            
+            # Sale Information
+            'sale_date': pdf_data.get('sale_date'),
             'sale_time': pdf_data.get('sale_time'),
             'sale_location': pdf_data.get('sale_location'),
-            'lender_name': pdf_data.get('lender_name'),
-            'attorney_info': pdf_data.get('attorney_info'),
-            'lot_block_subdivision': pdf_data.get('lot_block_subdivision'),
-            'parcel_number': pdf_data.get('parcel_number')
+            
+            # Attorney Information
+            'attorney_info': pdf_data.get('attorney_info', {}),
+            
+            # Processing Metadata
+            'ai_confidence': pdf_data.get('ai_confidence'),
+            'extraction_timestamp': pdf_data.get('extraction_timestamp'),
+            'parsed_date': datetime.now().isoformat()
         }
         
-        return updated_record
+        # Parse address components if available
+        if pdf_data.get('property_address'):
+            address_parts = self._parse_address(pdf_data['property_address'])
+            parsed_record.update(address_parts)
+        
+        # Parse borrower names if available
+        if pdf_data.get('borrower_names'):
+            borrowers = pdf_data['borrower_names']
+            if len(borrowers) >= 1:
+                name_parts = self._parse_name(borrowers[0])
+                parsed_record['owner_1_first_name'] = name_parts.get('first', '')
+                parsed_record['owner_1_last_name'] = name_parts.get('last', '')
+                if len(borrowers) >= 2:
+                    name_parts2 = self._parse_name(borrowers[1])
+                    parsed_record['owner_2_first_name'] = name_parts2.get('first', '')
+                    parsed_record['owner_2_last_name'] = name_parts2.get('last', '')
+                
+                # Create combined owner name
+                parsed_record['owner_name'] = ' & '.join(borrowers)
+        
+        return parsed_record
     
     def _parse_address(self, address: str) -> Dict[str, str]:
         """Parse address into components"""
@@ -839,33 +862,37 @@ class ForeClosureJSONUpdater:
         
         return {}
     
-    def update_with_pdf_data(self, foreclosure_data: ForeClosureData) -> bool:
-        """Update JSON file with parsed PDF data"""
-        # Load current data
-        json_records = self.load_foreclosure_data()
-        if not json_records:
+    def save_parsed_pdf_data(self, foreclosure_data: ForeClosureData) -> bool:
+        """Save parsed PDF data to separate JSON file"""
+        try:
+            # Load existing parsed data
+            parsed_records = self.load_parsed_data()
+            
+            # Check if already exists
+            if self.check_if_already_parsed(foreclosure_data, parsed_records):
+                print(f"⚠️ PDF {foreclosure_data.source_pdf_file} already parsed, skipping...")
+                return True
+            
+            # Create new parsed record
+            parsed_record = self.create_parsed_record(foreclosure_data)
+            
+            # Add to existing records
+            parsed_records.append(parsed_record)
+            
+            # Save updated data
+            self.save_parsed_data(parsed_records)
+            
+            # Mark as processed
+            self.processed_pdfs.add(foreclosure_data.source_pdf_file)
+            self.save_checkpoints()
+            
+            detail_id = foreclosure_data.source_pdf_file.replace('.pdf', '') if foreclosure_data.source_pdf_file else "Unknown"
+            print(f"✅ Saved parsed data for detail_id: {detail_id}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error saving parsed data for {foreclosure_data.source_pdf_file}: {e}")
             return False
-        
-        # Find matching record
-        record_index = self.find_matching_record(foreclosure_data, json_records)
-        if record_index is None:
-            print(f"⚠️ No matching record found for {foreclosure_data.source_pdf_file}")
-            return False
-        
-        # Update the record
-        original_record = json_records[record_index]
-        updated_record = self.update_record_with_pdf_data(original_record, foreclosure_data)
-        json_records[record_index] = updated_record
-        
-        # Save updated data
-        self.save_foreclosure_data(json_records)
-        
-        # Mark as processed
-        self.processed_pdfs.add(foreclosure_data.source_pdf_file)
-        self.save_checkpoints()
-        
-        print(f"✅ Updated record for detail_id: {original_record.get('detail_id')}")
-        return True
 
 class ForeClosurePDFProcessor:
     """Main processor that monitors and processes PDF files"""
@@ -873,12 +900,12 @@ class ForeClosurePDFProcessor:
     def __init__(self, api_key: str, base_dir: str):
         self.base_dir = base_dir
         self.pdf_dir = os.path.join(base_dir, 'pdf_files')
-        self.json_file = os.path.join(base_dir, 'collin_foreclosures.json')
+        self.parsed_data_file = os.path.join(base_dir, 'parsed_foreclosure_data.json')
         self.checkpoint_file = os.path.join(base_dir, 'pdf_parsing_checkpoints.json')
         
         # Initialize components
         self.parser = GeminiForeClosureParser(api_key)
-        self.updater = ForeClosureJSONUpdater(self.json_file, self.checkpoint_file)
+        self.updater = ForeClosureJSONUpdater(self.parsed_data_file, self.checkpoint_file)
         
         # Statistics
         self.stats = {
@@ -912,8 +939,8 @@ class ForeClosurePDFProcessor:
             if not foreclosure_data:
                 return False
             
-            # Update JSON
-            success = self.updater.update_with_pdf_data(foreclosure_data)
+            # Save parsed data to separate JSON file
+            success = self.updater.save_parsed_pdf_data(foreclosure_data)
             if success:
                 self.stats['successful_updates'] += 1
             else:
@@ -989,7 +1016,7 @@ class ForeClosurePDFProcessor:
 def main():
     """Main function"""
     # Gemini API Key
-    api_key = ""
+    api_key = "AIzaSyDazFB331RBkuK0geXQoYFpB1WaGfkVjd4"
     
     # Base directory
     base_dir = r"C:\Users\zarya\Desktop\Python\Collin_Counties_Test"
@@ -998,6 +1025,7 @@ def main():
     print("=" * 50)
     print(f"📁 Base Directory: {base_dir}")
     print(f"🔑 Using Gemini AI for PDF parsing")
+    print(f"💾 Parsed data will be saved to: parsed_foreclosure_data.json")
     print("=" * 50)
     
     try:
