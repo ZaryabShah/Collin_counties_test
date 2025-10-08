@@ -1027,16 +1027,189 @@ def write_outputs(rows, json_path="collin_foreclosures.json", csv_path="collin_f
             except Exception as e:
                 print(f"Error saving HTML file {html_filename}: {e}")
 
+def scrape_with_monitoring():
+    """
+    Continuous monitoring mode: scrape new entries every 10 minutes.
+    Only processes pages that have new entries, stops when no new entries found.
+    """
+    import time
+    from datetime import datetime
+    
+    print("Starting continuous monitoring mode (10-minute cycles)")
+    print("Will scrape new entries and stop at first page with no new entries")
+    
+    cycle_count = 0
+    
+    while True:
+        cycle_count += 1
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n{'='*60}")
+        print(f"CYCLE {cycle_count} - {current_time}")
+        print(f"{'='*60}")
+        
+        try:
+            # Load current state
+            processed_checkpoints = load_processed_checkpoints()
+            all_rows = load_existing_results()
+            
+            drv = make_driver(headless=True)
+            
+            # Check for missing PDFs in existing FILED entries first
+            filed_entries = find_filed_entries_without_pdf(all_rows)
+            if filed_entries:
+                print(f"Found {len(filed_entries)} existing FILED entries without PDFs. Downloading...")
+                download_missing_pdfs(drv, filed_entries)
+                # Update the main data with the new PDF info
+                for i, row in enumerate(all_rows):
+                    for filed_entry in filed_entries:
+                        if row.get("detail_id") == filed_entry.get("detail_id"):
+                            all_rows[i].update(filed_entry)
+                            break
+            
+            drv.get(URL)
+            wait_for_table(drv)
+            
+            # Configure sorting by Filed Date (descending) - same as before
+            try:
+                print("Setting up Filed Date sorting...")
+                
+                dropdown_selectors = [
+                    "/html/body/div[3]/div/div[3]/div[1]/div/div[2]/div[5]/div[1]/div/div/div[1]/div[1]",
+                    "/html/body/div[3]/div/div[3]/div[1]/div/div[2]/div[5]/div[1]/div/div/div[1]/div[2]/svg"
+                ]
+                
+                dropdown_clicked = False
+                for selector in dropdown_selectors:
+                    try:
+                        dropdown_element = WebDriverWait(drv, 10).until(
+                            EC.element_to_be_clickable((By.XPATH, selector))
+                        )
+                        dropdown_element.click()
+                        print(f"Clicked dropdown using selector: {selector}")
+                        dropdown_clicked = True
+                        break
+                    except Exception as e:
+                        continue
+                
+                if dropdown_clicked:
+                    time.sleep(1)
+                    try:
+                        filed_date_options = drv.find_elements(By.XPATH, "//div[contains(text(), 'Filed Date') or contains(text(), 'File Date')]")
+                        if filed_date_options:
+                            filed_date_options[-1].click()
+                            print("Selected 'Filed Date' option")
+                        else:
+                            dropdown_options = drv.find_elements(By.XPATH, "//div[@role='option' or contains(@class, 'mud-list-item')]")
+                            if dropdown_options:
+                                dropdown_options[-1].click()
+                                print("Selected last option in dropdown (assumed to be Filed Date)")
+                        
+                        time.sleep(1)
+                        sort_toggle = WebDriverWait(drv, 5).until(
+                            EC.element_to_be_clickable((By.XPATH, "/html/body/div[3]/div/div[3]/div[1]/div/div[2]/div[5]/div[2]/div/label"))
+                        )
+                        sort_toggle.click()
+                        print("Clicked sort order toggle")
+                        time.sleep(2)
+                        print("Successfully configured Filed Date sorting")
+                        
+                    except Exception as e:
+                        print(f"Error configuring sort options: {e}")
+            except Exception as e:
+                print(f"Error setting up sorting: {e}")
+            
+            drv.execute_script(HOOK_JS)  # install pushState hook once
+
+            seen = set()
+            pages_done = 0
+            newly_processed_count = 0
+            total_new_in_cycle = 0
+
+            # Start checking pages
+            while pages_done < 20:  # Max 20 pages per cycle
+                badge = current_page_badge(drv) or "?"
+                if badge in seen: break
+                seen.add(badge); pages_done += 1
+                print(f"Checking page {badge} for new entries...")
+
+                n = row_count(drv)
+                new_entries_on_this_page = 0
+                
+                for i in range(n):
+                    snap = snapshot_row(drv, i)
+                    if not snap or not snap.get("address"): continue
+
+                    # Check if this listing was already processed
+                    already_processed, method = is_already_processed(snap, processed_checkpoints, all_rows)
+                    
+                    if already_processed:
+                        continue  # Skip without logging to reduce noise
+                    
+                    # Found new entry - process it
+                    new_entries_on_this_page += 1
+                    total_new_in_cycle += 1
+                    print(f"Processing NEW entry #{total_new_in_cycle}: {snap.get('address', '')}")
+                    
+                    detail_data = scrape_detail_page_in_new_tab(drv, i)
+                    if detail_data:
+                        list_sale_date = snap.get("sale_date", "")
+                        list_file_date = snap.get("file_date", "")
+                        snap.update(detail_data)
+                        snap["sale_date"] = list_sale_date
+                        snap["file_date"] = list_file_date
+                        
+                        if detail_data.get("is_filed_entry") and detail_data.get("pdf_filename"):
+                            snap["pdf_downloaded"] = True
+                        else:
+                            snap["pdf_downloaded"] = False
+                    
+                    all_rows.append(snap)
+                    newly_processed_count += 1
+                    
+                    updated_checkpoint_key = create_checkpoint_key(snap)
+                    updated_checkpoint_tuple = tuple(sorted(updated_checkpoint_key.items()))
+                    processed_checkpoints.add(updated_checkpoint_tuple)
+                    save_checkpoint(processed_checkpoints)
+
+                print(f"Page {badge}: Found {new_entries_on_this_page} new entries")
+                
+                # If no new entries on this page, stop checking more pages
+                if new_entries_on_this_page == 0:
+                    print(f"No new entries found on page {badge} - stopping page traversal")
+                    break
+
+                # Go to next page if there were new entries
+                if not click_next_page(drv): 
+                    print("No more pages available")
+                    break
+
+            drv.quit()
+            
+            # Save results if any new entries were found
+            if total_new_in_cycle > 0:
+                write_outputs(all_rows)
+                print(f"Cycle {cycle_count} complete: Processed {total_new_in_cycle} new entries")
+                print("Saved: collin_foreclosures.json, collin_foreclosures.csv, and HTML files")
+            else:
+                print(f"Cycle {cycle_count} complete: No new entries found")
+            
+        except Exception as e:
+            print(f"Error in cycle {cycle_count}: {e}")
+            try:
+                drv.quit()
+            except:
+                pass
+        
+        # Wait 10 minutes before next cycle
+        print(f"\nWaiting 10 minutes before next cycle...")
+        print(f"Next cycle will start at: {datetime.fromtimestamp(time.time() + 600).strftime('%Y-%m-%d %H:%M:%S')}")
+        time.sleep(600)  # 10 minutes = 600 seconds
+
 if __name__ == "__main__":
-    # Examples of different usage:
-    # data = scrape_all()  # Default: scrape up to 20 pages
-    # data = scrape_all(max_pages=5)  # Scrape maximum 5 pages
-    # data = scrape_all(max_listings=10)  # Stop after collecting 10 listings
-    # data = scrape_all(stop_after_first_page=True)  # Stop after first page only
-    # data = scrape_all(max_pages=3, max_listings=15)  # Stop at 3 pages OR 15 listings, whichever comes first
-    # data = scrape_all(max_listings=5)
-    data = scrape_all()
-  # For testing - only first page
-    print(f"Total records in database: {len(data)} rows with detailed page data.")
-    write_outputs(data)
-    print("Saved: collin_foreclosures.json, collin_foreclosures.csv, and HTML files in html_pages/ directory")
+    # Choose mode:
+    # scrape_with_monitoring()  # Continuous 10-minute monitoring
+    # OR
+    # data = scrape_all()  # One-time scraping
+    
+    # Start continuous monitoring mode
+    scrape_with_monitoring()
